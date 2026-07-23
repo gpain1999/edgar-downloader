@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.Python
+
+# Environnements virtuels
+venv/
+.venv/
+env/
+
+# Sorties locales du script CLI
+filings/
+*.zip
+listing_filings.csv
+
+# Éditeurs / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Secrets Streamlit (ne jamais committer)
+.streamlit/secrets.toml
