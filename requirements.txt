@@ -1,3 +1,4 @@
 streamlit
 aiohttp
 markdownify
+beautifulsoup4
