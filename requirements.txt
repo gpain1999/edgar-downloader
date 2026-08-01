@@ -2,3 +2,4 @@ streamlit
 aiohttp
 markdownify
 beautifulsoup4
+fpdf2
