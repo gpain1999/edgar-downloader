@@ -33,12 +33,14 @@ import os
 import re
 import shutil
 import tempfile
+import textwrap
 import zipfile
 from datetime import datetime
 
 import aiohttp
 import streamlit as st
 from bs4 import BeautifulSoup
+from fpdf import FPDF
 from markdownify import markdownify as _to_md
 
 st.set_page_config(page_title="SEC EDGAR → Markdown", page_icon="📄", layout="wide")
@@ -109,18 +111,81 @@ def safe_name(s):
     return re.sub(r"[^A-Za-z0-9_-]+", "_", s).strip("_")[:40]
 
 
-def to_markdown(html_text):
-    """HTML -> Markdown, en retirant d'abord le XBRL 'inline' caché qui pollue
-    l'en-tête des 20-F / 10-K, ainsi que les éléments non affichés."""
+# ---------------------------------------------------------------------------
+#  Conversion multi-formats : Markdown (.md) / Texte (.txt) / PDF (.pdf)
+# ---------------------------------------------------------------------------
+_FONT_CANDIDATES = [
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "DejaVuSans.ttf"),
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "C:\\Windows\\Fonts\\arial.ttf",
+]
+
+
+def _font_path():
+    for p in _FONT_CANDIDATES:
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def _clean_soup(html_text):
+    """Retire le XBRL 'inline' caché et les éléments non affichés."""
+    soup = BeautifulSoup(html_text, "html.parser")
+    for tag in soup.find_all(["ix:header", "ix:hidden", "script", "style", "head"]):
+        tag.decompose()
+    for tag in soup.find_all(style=re.compile(r"display\s*:\s*none", re.I)):
+        tag.decompose()
+    return soup
+
+
+def _md_to_text(md):
+    """Markdown -> texte lisible : enlève #, **, * ; garde les tableaux."""
+    md = re.sub(r"^#{1,6}\s*", "", md, flags=re.M)
+    md = re.sub(r"\*\*(.+?)\*\*", r"\1", md, flags=re.S)
+    md = re.sub(r"(?<!\*)\*(?!\*)(.+?)\*(?!\*)", r"\1", md, flags=re.S)
+    return md
+
+
+def _text_to_pdf(text):
+    """Texte -> PDF (reflow simple). Robuste aux tokens très longs."""
+    lines = []
+    for line in text.split("\n"):
+        wrapped = textwrap.wrap(line, width=100, break_long_words=True,
+                                break_on_hyphens=False)
+        lines.extend(wrapped or [""])
+
+    pdf = FPDF(format="A4")
+    pdf.set_auto_page_break(auto=True, margin=12)
+    pdf.add_page()
+    font = _font_path()
+    if font:
+        pdf.add_font("body", "", font)
+        pdf.set_font("body", size=8)
+    else:                                   # secours : latin-1 (accents perdus)
+        pdf.set_font("helvetica", size=8)
+        lines = [l.encode("latin-1", "replace").decode("latin-1") for l in lines]
+
+    for l in lines:
+        try:
+            pdf.multi_cell(0, 3.5, l if l else " ")
+        except Exception:
+            pass                            # ligne pathologique ignorée
+    return bytes(pdf.output())
+
+
+def render_output(html_text, fmt):
+    """Renvoie (bytes, extension) pour le format demandé : 'md', 'txt' ou 'pdf'."""
     try:
-        soup = BeautifulSoup(html_text, "html.parser")
-        for tag in soup.find_all(["ix:header", "ix:hidden", "script", "style", "head"]):
-            tag.decompose()
-        for tag in soup.find_all(style=re.compile(r"display\s*:\s*none", re.I)):
-            tag.decompose()
-        return _to_md(str(soup), heading_style="ATX", strip=["script", "style"])
+        soup = _clean_soup(html_text)
+        md = _to_md(str(soup), heading_style="ATX", strip=["script", "style"])
     except Exception:
-        return None
+        return None, fmt
+
+    if fmt == "txt":
+        return _md_to_text(md).encode("utf-8"), "txt"
+    if fmt == "pdf":
+        return _text_to_pdf(_md_to_text(md)), "pdf"
+    return md.encode("utf-8"), "md"          # défaut : markdown
 
 
 def resolve_cik(identifier, ticker_map):
@@ -241,7 +306,7 @@ async def browse_by_sic(sic, form_type, max_companies, user_agent, progress=None
 # ---------------------------------------------------------------------------
 #  Pipeline de téléchargement (async) — écrit sur DISQUE, pas en RAM
 # ---------------------------------------------------------------------------
-async def run_pipeline(idents, forms, ymin, ymax, user_agent, cap, ui):
+async def run_pipeline(idents, forms, ymin, ymax, user_agent, cap, fmt, ui):
     limiter = RateLimiter(0.12)
     logs = []
     listing = []
@@ -308,30 +373,29 @@ async def run_pipeline(idents, forms, ymin, ymax, user_agent, cap, ui):
                     y = year_of(f)
                     base = f"{y}_{f['form'].replace('/', '-')}"
                     folder = safe_name(name) or cik
-                    rel = f"{folder}/{base}.md"
 
                     html = await fetch(session, url, limiter)
-                    md_path = ""
+                    out_path = ""
                     if html is None:
                         log(f"[X] {name} {base} : échec téléchargement")
                     else:
-                        md = await asyncio.to_thread(to_markdown, html)
+                        data, ext = await asyncio.to_thread(render_output, html, fmt)
                         del html                      # libère la RAM tout de suite
-                        if md:
+                        if data:
                             d = os.path.join(workdir, folder)
                             os.makedirs(d, exist_ok=True)
-                            with open(os.path.join(d, base + ".md"), "w",
-                                      encoding="utf-8") as out:
-                                out.write(md)
-                            md_path = rel
-                            log(f"[OK] {name} {base}")
+                            fname = f"{base}.{ext}"
+                            with open(os.path.join(d, fname), "wb") as out:
+                                out.write(data)
+                            out_path = f"{folder}/{fname}"
+                            log(f"[OK] {name} {base}.{ext}")
                         else:
                             log(f"[!] {name} {base} : conversion échouée")
 
                     listing.append({
                         "societe": name, "cik": cik, "forme": f["form"], "annee": y,
                         "date_depot": f["filing_date"], "date_rapport": f["report_date"],
-                        "accession": f["accession"], "fichier_md": md_path, "url_sec": url,
+                        "accession": f["accession"], "fichier": out_path, "url_sec": url,
                     })
                     done["n"] += 1
                     ui["bar"].progress(done["n"] / total)
@@ -363,7 +427,7 @@ async def run_pipeline(idents, forms, ymin, ymax, user_agent, cap, ui):
             zip_bytes = zf.read()
         os.remove(zip_path)
 
-        n_ok = sum(1 for r in listing if r["fichier_md"])
+        n_ok = sum(1 for r in listing if r["fichier"])
         return zip_bytes, csv_text, n_ok, total
 
     finally:
@@ -385,6 +449,15 @@ with st.sidebar:
         help="Exigé par la SEC sur chaque requête. Sans email valide → erreur 403.",
     )
     forms = st.multiselect("Formes", ["10-K", "20-F"], default=["10-K", "20-F"])
+
+    fmt_label = st.radio(
+        "Format de sortie",
+        ["Markdown (.md)", "Texte (.txt)", "PDF (.pdf)"],
+        help="Markdown : idéal pour l'extraction. Texte : brut lisible. "
+             "PDF : document reflowé (plus lent à générer).",
+    )
+    fmt = {"Markdown (.md)": "md", "Texte (.txt)": "txt", "PDF (.pdf)": "pdf"}[fmt_label]
+
     c1, c2 = st.columns(2)
     ymin = c1.number_input("Année min", 1995, 2100, 2020)
     ymax = c2.number_input("Année max", 1995, 2100, datetime.now().year)
@@ -490,7 +563,7 @@ if launch:
         try:
             zip_bytes, csv_text, n_ok, n_total = asyncio.run(
                 run_pipeline(idents, set(forms), int(ymin), int(ymax),
-                             user_agent, int(cap), ui))
+                             user_agent, int(cap), fmt, ui))
             if zip_bytes:
                 st.session_state["zip"] = zip_bytes
                 st.session_state["csv"] = csv_text
