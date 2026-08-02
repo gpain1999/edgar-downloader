@@ -2,4 +2,5 @@ streamlit
 aiohttp
 markdownify
 beautifulsoup4
-fpdf2
+xhtml2pdf
+markdown
