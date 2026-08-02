@@ -28,20 +28,25 @@ Déploiement gratuit : share.streamlit.io (dépôt GitHub public).
 
 import asyncio
 import csv
+import html as _htmllib
 import io
+import logging
 import os
 import re
 import shutil
 import tempfile
-import textwrap
 import zipfile
 from datetime import datetime
 
 import aiohttp
+import markdown as _markdown
 import streamlit as st
-from bs4 import BeautifulSoup
-from fpdf import FPDF
 from markdownify import markdownify as _to_md
+from xhtml2pdf import pisa
+
+# xhtml2pdf/reportlab sont bavards (images manquantes, etc.) : on les fait taire.
+for _n in ("xhtml2pdf", "pisa", "reportlab", "PIL"):
+    logging.getLogger(_n).setLevel(logging.CRITICAL)
 
 st.set_page_config(page_title="SEC EDGAR → Markdown", page_icon="📄", layout="wide")
 
@@ -114,28 +119,28 @@ def safe_name(s):
 # ---------------------------------------------------------------------------
 #  Conversion multi-formats : Markdown (.md) / Texte (.txt) / PDF (.pdf)
 # ---------------------------------------------------------------------------
-_FONT_CANDIDATES = [
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "DejaVuSans.ttf"),
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    "C:\\Windows\\Fonts\\arial.ttf",
+# ---------------------------------------------------------------------------
+#  Conversion multi-formats : Markdown (.md) / Texte (.txt) / PDF (.pdf)
+# ---------------------------------------------------------------------------
+_COVER_MARKERS = [
+    re.compile(r"SECURITIES\s+AND\s+EXCHANGE\s+COMMISSION", re.I),
+    re.compile(r"\bUNITED\s+STATES\b", re.I),
+    re.compile(r"\bFORM\s+(?:20-F|10-K)\b", re.I),
 ]
 
 
-def _font_path():
-    for p in _FONT_CANDIDATES:
-        if os.path.exists(p):
-            return p
-    return None
-
-
-def _clean_soup(html_text):
-    """Retire le XBRL 'inline' caché et les éléments non affichés."""
-    soup = BeautifulSoup(html_text, "html.parser")
-    for tag in soup.find_all(["ix:header", "ix:hidden", "script", "style", "head"]):
-        tag.decompose()
-    for tag in soup.find_all(style=re.compile(r"display\s*:\s*none", re.I)):
-        tag.decompose()
-    return soup
+def _strip_xbrl_noise(text):
+    """Retire le bloc XBRL 'inline' + la déclaration xml collés en tête, en
+    coupant avant la page de garde SEC. Opère sur le TEXTE déjà converti :
+    robuste, contrairement à une suppression de balises dans l'arbre HTML
+    (que html.parser imbrique mal sur le vrai HTML de la SEC)."""
+    lines = text.split("\n")
+    for marker in _COVER_MARKERS:
+        for i, line in enumerate(lines[:5000]):
+            if marker.search(line):
+                return "\n".join(lines[i:]).lstrip("\n")
+    kept = [l for l in lines if len(l) < 2000]
+    return "\n".join(kept).lstrip("\n")
 
 
 def _md_to_text(md):
@@ -146,45 +151,56 @@ def _md_to_text(md):
     return md
 
 
-def _text_to_pdf(text):
-    """Texte -> PDF (reflow simple). Robuste aux tokens très longs."""
-    lines = []
-    for line in text.split("\n"):
-        wrapped = textwrap.wrap(line, width=100, break_long_words=True,
-                                break_on_hyphens=False)
-        lines.extend(wrapped or [""])
+_PDF_CSS = """
+<style>
+@page { size: A4; margin: 1.4cm; }
+body { font-family: Helvetica; font-size: 7.5pt; line-height: 1.3; }
+h1 { font-size: 13pt; margin: 10pt 0 4pt; }
+h2 { font-size: 11pt; margin: 8pt 0 4pt; }
+h3 { font-size: 9pt; margin: 6pt 0 3pt; }
+p  { margin: 0 0 4pt; }
+table { border-collapse: collapse; width: 100%; margin: 4pt 0; }
+td, th { border: 0.5px solid #888; padding: 2px 4px; font-size: 6.5pt; }
+th { background: #eee; font-weight: bold; }
+</style>
+"""
 
-    pdf = FPDF(format="A4")
-    pdf.set_auto_page_break(auto=True, margin=12)
-    pdf.add_page()
-    font = _font_path()
-    if font:
-        pdf.add_font("body", "", font)
-        pdf.set_font("body", size=8)
-    else:                                   # secours : latin-1 (accents perdus)
-        pdf.set_font("helvetica", size=8)
-        lines = [l.encode("latin-1", "replace").decode("latin-1") for l in lines]
 
-    for l in lines:
-        try:
-            pdf.multi_cell(0, 3.5, l if l else " ")
-        except Exception:
-            pass                            # ligne pathologique ignorée
-    return bytes(pdf.output())
+def _md_to_pdf(md):
+    """Markdown -> HTML (avec vrais tableaux) -> PDF via xhtml2pdf.
+    Bien plus lisible qu'un reflow texte : titres, grilles, colonnes alignées."""
+    body = _markdown.markdown(md, extensions=["tables"])
+    body = re.sub(r"<img[^>]*>", "", body)          # images du rapport non résolues
+    doc = f"<html><head>{_PDF_CSS}</head><body>{body}</body></html>"
+    try:
+        out = io.BytesIO()
+        pisa.CreatePDF(io.StringIO(doc), dest=out, encoding="utf-8")
+        data = out.getvalue()
+        if data:
+            return data
+    except Exception:
+        pass
+    # secours : texte brut échappé, très robuste
+    safe = _htmllib.escape(_md_to_text(md))
+    doc2 = f"<html><head>{_PDF_CSS}</head><body><pre>{safe}</pre></body></html>"
+    out = io.BytesIO()
+    pisa.CreatePDF(io.StringIO(doc2), dest=out, encoding="utf-8")
+    return out.getvalue() or None
 
 
 def render_output(html_text, fmt):
-    """Renvoie (bytes, extension) pour le format demandé : 'md', 'txt' ou 'pdf'."""
+    """Renvoie (bytes, extension) pour le format demandé : 'md', 'txt' ou 'pdf'.
+    Conversion Markdown (qui préserve tout le contenu) puis nettoyage texte."""
     try:
-        soup = _clean_soup(html_text)
-        md = _to_md(str(soup), heading_style="ATX", strip=["script", "style"])
+        md = _to_md(html_text, heading_style="ATX", strip=["script", "style"])
+        md = _strip_xbrl_noise(md)
     except Exception:
         return None, fmt
 
     if fmt == "txt":
         return _md_to_text(md).encode("utf-8"), "txt"
     if fmt == "pdf":
-        return _text_to_pdf(_md_to_text(md)), "pdf"
+        return _md_to_pdf(md), "pdf"
     return md.encode("utf-8"), "md"          # défaut : markdown
 
 
@@ -365,7 +381,8 @@ async def run_pipeline(idents, forms, ymin, ymax, user_agent, cap, fmt, ui):
 
             # --- Phase 2 : téléchargement + conversion ---
             done = {"n": 0}
-            sem = asyncio.Semaphore(5)
+            # Le PDF (xhtml2pdf) est plus lourd en mémoire : on limite le parallélisme.
+            sem = asyncio.Semaphore(2 if fmt == "pdf" else 5)
 
             async def handle(cik, name, f):
                 async with sem:
@@ -454,7 +471,8 @@ with st.sidebar:
         "Format de sortie",
         ["Markdown (.md)", "Texte (.txt)", "PDF (.pdf)"],
         help="Markdown : idéal pour l'extraction. Texte : brut lisible. "
-             "PDF : document reflowé (plus lent à générer).",
+             "PDF : document mis en forme (tableaux en grille) — plus lent, "
+             "à réserver aux petits lots.",
     )
     fmt = {"Markdown (.md)": "md", "Texte (.txt)": "txt", "PDF (.pdf)": "pdf"}[fmt_label]
 
